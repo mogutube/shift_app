@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import calendar
 from datetime import date
+
+import holidays
 from flask import Flask, render_template, request, jsonify
 from ortools.sat.python import cp_model
 
@@ -22,22 +24,20 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
     days = range(1, n_days + 1)
     open_days = [d for d in days if d not in closed_days]
 
-    # ポジション込みの勤務ペアは「A担当者 → B担当者」の順序付きペアとして扱う。
-    # 6人なら A を6通り、その人以外の B を5通り選べるため 6*5=30 通り。
+    # ポジション込みの勤務ペアは「A担当者 → B担当者」の順序付きペア。
+    # 6人なら 6*5=30 通りなので、営業日は最大30日。
     if len(open_days) > 30:
         return None, (
             f"営業日が{len(open_days)}日ありますが、6人で作れるポジション込みの勤務ペアは30通りしかありません。"
             "『同じ A担当者・B担当者 の組み合わせは月内で1回だけ』を守る場合、営業日は最大30日です。"
         )
 
-    # 各人の休み希望は最大5日。
     for i, req in enumerate(requests):
         if len(req) > 5:
             return None, f"{names[i]}さんの休み希望が{len(req)}日あります。1人5日までです。"
 
     model = cp_model.CpModel()
 
-    # work[p,d], A[p,d], B[p,d]
     work = {}
     pos_a = {}
     pos_b = {}
@@ -51,7 +51,7 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
             if d in closed_days or d in requests[p]:
                 model.Add(work[p, d] == 0)
 
-    # 営業日は必ず2人、AとBが各1人。休業日は0人。
+    # 営業日は2人、A/B各1人。休業日は0人。
     for d in days:
         if d in closed_days:
             model.Add(sum(work[p, d] for p in people) == 0)
@@ -62,7 +62,7 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
             model.Add(sum(pos_a[p, d] for p in people) == 1)
             model.Add(sum(pos_b[p, d] for p in people) == 1)
 
-    # 勤務日数の差を1以内にする。
+    # 勤務日数差1以内。
     total_slots = 2 * len(open_days)
     min_work = total_slots // 6
     max_work = (total_slots + 5) // 6
@@ -74,15 +74,12 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
         model.Add(t <= max_work)
         totals.append(t)
 
-    # 連勤禁止（カレンダー上で隣り合う日）。
+    # 連勤禁止。
     for p in people:
         for d in range(1, n_days):
             model.Add(work[p, d] + work[p, d + 1] <= 1)
 
-    # 「中5日以上空く」を禁止。
-    # 初回勤務前と最終勤務後は制限せず、勤務と次勤務の間だけ
-    # 5日以上の完全な空白が生じないようにする。
-    # 状態: 0=まだ勤務なし, 1=直前が勤務, 2..5=勤務後1..4日休み, 6=5日以上休み(以後勤務不可)
+    # 中5日以上空くのを禁止（勤務間のみ）。
     gap_transitions = [
         (0, 0, 0), (0, 1, 1),
         (1, 1, 1), (1, 0, 2),
@@ -100,22 +97,20 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
             gap_transitions,
         )
 
-    # 各曜日の勤務は1人3回まで。
+    # 同じ曜日の勤務は1人3回まで。
     for p in people:
         for weekday in range(7):
             weekday_days = [d.day for d in dates if d.weekday() == weekday]
             model.Add(sum(work[p, d] for d in weekday_days) <= 3)
 
-    # A/B回数の差は1以内。
+    # A/B回数差1以内。
     for p in people:
         a_total = sum(pos_a[p, d] for d in days)
         b_total = sum(pos_b[p, d] for d in days)
         model.Add(a_total - b_total <= 1)
         model.Add(b_total - a_total <= 1)
 
-    # 同じポジションが「その人の勤務回ベース」で4回連続しない。
-    # symbol: 0=休み, 1=A, 2=B。休みの日は連続回数をリセットしない。
-    # states: 0=未勤務, 1=A1,2=A2,3=A3,4=B1,5=B2,6=B3
+    # 同じポジション4回連続禁止（勤務回ベース）。
     pos_transitions = [
         (0, 0, 0), (0, 1, 1), (0, 2, 4),
         (1, 0, 1), (1, 1, 2), (1, 2, 4),
@@ -133,10 +128,7 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
             symbols.append(s)
         model.AddAutomaton(symbols, 0, [0, 1, 2, 3, 4, 5, 6], pos_transitions)
 
-    # ポジション込みで同じ勤務ペアは月内1回のみ。
-    # 例: X=A, Y=B と X=B, Y=A は別ペア。
-    # ordered_pair[p,q,d] = 1 <=> p が A、q が B。p != q。
-    ordered_pairs = {}
+    # 同じ順序付きペア(A担当者,B担当者)は月内1回のみ。
     for p in people:
         for q in people:
             if p == q:
@@ -147,45 +139,51 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
                 model.Add(ordered_pair <= pos_a[p, d])
                 model.Add(ordered_pair <= pos_b[q, d])
                 model.Add(ordered_pair >= pos_a[p, d] + pos_b[q, d] - 1)
-                ordered_pairs[p, q, d] = ordered_pair
                 pair_occurrences.append(ordered_pair)
             model.Add(sum(pair_occurrences) <= 1)
 
-    # 同じ2人の組み合わせ（ポジションは無視）は、再登場まで日付差を10日以上空ける。
-    # 例: 1日に X=A,Y=B で勤務した場合、2〜10日には X/Y の組み合わせは不可。
-    # 11日以降なら X=B,Y=A のようにポジションを入れ替えて再度組むことができる。
-    # なお、同じ向き X=A,Y=B は上の制約により月内1回のみ。
+    # 同じ2人組は、ポジションを無視して10日以上空ける。
+    # 例: 1日に一緒に勤務した場合、2〜10日は再ペア禁止、11日以降は可。
     for p in people:
         for q in people:
             if p >= q:
                 continue
-            for i, d1 in enumerate(open_days):
-                for d2 in open_days[i + 1:]:
-                    if d2 - d1 < 10:
-                        # unordered pair {p,q} が両日で同時に勤務することを禁止。
-                        model.Add(
-                            ordered_pairs[p, q, d1]
-                            + ordered_pairs[q, p, d1]
-                            + ordered_pairs[p, q, d2]
-                            + ordered_pairs[q, p, d2]
-                            <= 1
-                        )
+            together = {}
+            for d in open_days:
+                v = model.NewBoolVar(f"together_{p}_{q}_{d}")
+                model.Add(v <= work[p, d])
+                model.Add(v <= work[q, d])
+                model.Add(v >= work[p, d] + work[q, d] - 1)
+                together[d] = v
+            for d1 in open_days:
+                for d2 in open_days:
+                    if d1 < d2 and d2 - d1 < 10:
+                        model.Add(together[d1] + together[d2] <= 1)
 
-    # 土日の勤務数も全員差1以内。
-    weekend_days = [d.day for d in dates if d.weekday() in (5, 6) and d.day not in closed_days]
-    weekend_slots = 2 * len(weekend_days)
-    min_weekend = weekend_slots // 6
-    max_weekend = (weekend_slots + 5) // 6
-    weekend_totals = []
+    # 土日祝日の勤務数を全員差1以内。
+    jp_holidays = holidays.Japan(years=[year])
+    weekend_holiday_days = [
+        dt.day
+        for dt in dates
+        if (
+            dt.weekday() in (5, 6)
+            or dt in jp_holidays
+        )
+        and dt.day not in closed_days
+    ]
+
+    holiday_slots = 2 * len(weekend_holiday_days)
+    min_holiday = holiday_slots // 6
+    max_holiday = (holiday_slots + 5) // 6
+    holiday_totals = []
     for p in people:
-        wt = model.NewIntVar(0, len(weekend_days), f"weekend_{p}")
-        model.Add(wt == sum(work[p, d] for d in weekend_days))
-        model.Add(wt >= min_weekend)
-        model.Add(wt <= max_weekend)
-        weekend_totals.append(wt)
+        ht = model.NewIntVar(0, len(weekend_holiday_days), f"weekend_holiday_{p}")
+        model.Add(ht == sum(work[p, d] for d in weekend_holiday_days))
+        model.Add(ht >= min_holiday)
+        model.Add(ht <= max_holiday)
+        holiday_totals.append(ht)
 
-    # 完全な公平条件内で、勤務日の偏りを少しだけ抑える補助目的。
-    # 早い日・遅い日の偏りが極端になりにくいよう、勤務日の重心差を最小化。
+    # 補助目的：勤務日の偏りを抑える。
     day_sums = []
     for p in people:
         ds = model.NewIntVar(0, n_days * n_days, f"day_sum_{p}")
@@ -214,11 +212,9 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
             "指定された条件を破るシフトは表示しません。"
         )
 
-    # 念のため、ソルバーが返した解をアプリ側でも再検証する。
-    # 1つでも条件違反が見つかった場合は結果を返さない。
+    # ===== 生成後の再検証 =====
     violations = []
 
-    # 営業日/店休日、A/B人数
     for d in days:
         wc = sum(solver.Value(work[p, d]) for p in people)
         ac = sum(solver.Value(pos_a[p, d]) for p in people)
@@ -227,13 +223,13 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
         if wc != expected or ac != (0 if d in closed_days else 1) or bc != (0 if d in closed_days else 1):
             violations.append(f"{d}日の勤務人数/ポジション人数")
 
-    # 個人ごとの勤務日数、休み希望、連勤、勤務間隔、曜日、A/B、同一ポジション連続
     solved_totals = []
-    solved_weekends = []
+    solved_holidays = []
+
     for p in people:
         work_days = [d for d in days if solver.Value(work[p, d])]
         solved_totals.append(len(work_days))
-        solved_weekends.append(sum(1 for d in weekend_days if solver.Value(work[p, d])))
+        solved_holidays.append(sum(1 for d in weekend_holiday_days if solver.Value(work[p, d])))
 
         if any(d in requests[p] for d in work_days):
             violations.append(f"{names[p]}さんの休み希望")
@@ -254,9 +250,7 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
         if abs(a_count - b_count) > 1:
             violations.append(f"{names[p]}さんのA/B回数")
 
-        position_sequence = []
-        for d in work_days:
-            position_sequence.append("A" if solver.Value(pos_a[p, d]) else "B")
+        position_sequence = ["A" if solver.Value(pos_a[p, d]) else "B" for d in work_days]
         streak = 0
         prev = None
         for position in position_sequence:
@@ -268,28 +262,31 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
 
     if solved_totals and max(solved_totals) - min(solved_totals) > 1:
         violations.append("全員の勤務日数差")
-    if solved_weekends and max(solved_weekends) - min(solved_weekends) > 1:
-        violations.append("全員の土日勤務日数差")
 
-    # 順序付きペア (A担当者, B担当者) の重複
-    seen_pairs = set()
-    # ポジションを無視した2人組について、前回から10日未満での再登場も禁止。
-    last_unordered_pair_day = {}
+    if solved_holidays and max(solved_holidays) - min(solved_holidays) > 1:
+        violations.append("全員の土日祝勤務日数差")
+
+    # 順序付きペア重複
+    seen_ordered_pairs = set()
+    pair_history = {}
     for d in open_days:
         a_person = next(p for p in people if solver.Value(pos_a[p, d]))
         b_person = next(p for p in people if solver.Value(pos_b[p, d]))
-        pair = (a_person, b_person)
-        if pair in seen_pairs:
+        ordered = (a_person, b_person)
+        if ordered in seen_ordered_pairs:
             violations.append("ポジション込み勤務ペアの重複")
             break
-        seen_pairs.add(pair)
+        seen_ordered_pairs.add(ordered)
 
-        unordered_pair = tuple(sorted((a_person, b_person)))
-        if unordered_pair in last_unordered_pair_day:
-            if d - last_unordered_pair_day[unordered_pair] < 10:
-                violations.append("同じ2人の組み合わせの勤務間隔が10日未満")
-                break
-        last_unordered_pair_day[unordered_pair] = d
+        unordered = tuple(sorted((a_person, b_person)))
+        pair_history.setdefault(unordered, []).append(d)
+
+    # 同じ2人組は10日以上空ける
+    for pair, ds in pair_history.items():
+        ds.sort()
+        if any(b - a < 10 for a, b in zip(ds, ds[1:])):
+            violations.append("同じ2人組の勤務間隔が10日未満")
+            break
 
     if violations:
         return None, (
@@ -299,6 +296,7 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
 
     rows = []
     member_stats = []
+
     for dt in dates:
         d = dt.day
         assignments = []
@@ -308,10 +306,13 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
                     assignments.append({"name": names[p], "mark": "◎", "position": "A"})
                 elif solver.Value(pos_b[p, d]):
                     assignments.append({"name": names[p], "mark": "◯", "position": "B"})
+
         rows.append({
             "day": d,
             "weekday": JP_WEEKDAYS[dt.weekday()],
             "closed": d in closed_days,
+            "holiday": dt in jp_holidays,
+            "holiday_name": jp_holidays.get(dt, ""),
             "assignments": assignments,
         })
 
@@ -327,7 +328,7 @@ def solve_shift(year: int, month: int, names: list[str], closed_days: set[int], 
             "total": a_count + b_count,
             "A": a_count,
             "B": b_count,
-            "weekend": sum(solver.Value(work[p, d]) for d in weekend_days),
+            "weekend_holiday": sum(solver.Value(work[p, d]) for d in weekend_holiday_days),
             "weekday_counts": weekday_counts,
         })
 
@@ -352,12 +353,14 @@ def generate():
         year = int(data["year"])
         month = int(data["month"])
         names = [str(x).strip() for x in data["names"]]
+
         if len(names) != 6 or any(not n for n in names):
             return jsonify({"ok": False, "error": "6人全員の名前を入力してください。"}), 400
         if len(set(names)) != 6:
             return jsonify({"ok": False, "error": "メンバー名は6人すべて異なる名前にしてください。"}), 400
 
         n_days = calendar.monthrange(year, month)[1]
+
         closed_days = {int(d) for d in data.get("closed_days", [])}
         if any(d < 1 or d > n_days for d in closed_days):
             return jsonify({"ok": False, "error": "休業日に対象月以外の日付が含まれています。"}), 400
@@ -365,6 +368,7 @@ def generate():
         raw_requests = data.get("requests", [])
         if len(raw_requests) != 6:
             raw_requests = [[] for _ in range(6)]
+
         requests = []
         for req in raw_requests:
             s = {int(d) for d in req}
@@ -376,9 +380,6 @@ def generate():
         if error:
             return jsonify({"ok": False, "error": error}), 200
         return jsonify({"ok": True, "result": result})
+
     except (KeyError, ValueError, TypeError):
         return jsonify({"ok": False, "error": "入力内容を確認してください。"}), 400
-
-
-if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5050)

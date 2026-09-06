@@ -2,8 +2,8 @@ services:
   - type: web
     name: shift-generator
     runtime: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app
-    healthCheckPath: /
-    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
